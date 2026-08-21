@@ -1068,8 +1068,7 @@ def channel_rule_violation(channel: str, output: str):
 
 
 @app.post("/sanitize-output")
-def sanitize_output(payload: Any):
-
+def sanitize_output(payload: Any = Body(...)):
     # ========================================================
     # 1. INVALID_SCHEMA
     # ========================================================
