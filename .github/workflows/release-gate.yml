@@ -14,7 +14,7 @@ jobs:
 
     steps:
       - name: "TDS identity: 23f2004577@ds.study.iitm.ac.in"
-        run: echo "TDS identity: 23f2004577@ds.study.iitm.ac.in"
+        run: 'echo "TDS identity: 23f2004577@ds.study.iitm.ac.in"'
 
       - name: Checkout
         uses: actions/checkout@v4
