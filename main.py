@@ -424,14 +424,16 @@ def exact_type(value, expected_type):
 
 def valid_terraform_schema(payload):
     """
-    Validate the complete normalized request schema first.
-    If this fails, the answer must be INVALID_PLAN.
+    Validate the required fields and their types.
+    Extra fields are allowed because the question specifies
+    value-type validation rather than an exact-key schema.
     """
 
-    if not exact_type(payload, dict):
+    if type(payload) is not dict:
         return False
 
-    required_top = {
+    # Required top-level fields
+    required = {
         "environment",
         "state",
         "providerVersion",
@@ -439,40 +441,40 @@ def valid_terraform_schema(payload):
         "resource",
     }
 
-    if set(payload.keys()) != required_top:
+    if not required.issubset(payload.keys()):
         return False
 
     # environment
-    if not exact_type(payload["environment"], str):
+    if type(payload["environment"]) is not str:
         return False
 
     # state
     state = payload["state"]
 
-    if not exact_type(state, dict):
+    if type(state) is not dict:
         return False
 
-    if set(state.keys()) != {"backend", "locked"}:
+    if "backend" not in state or "locked" not in state:
         return False
 
-    if not exact_type(state["backend"], str):
+    if type(state["backend"]) is not str:
         return False
 
-    if not exact_type(state["locked"], bool):
+    if type(state["locked"]) is not bool:
         return False
 
     # providerVersion
-    if not exact_type(payload["providerVersion"], str):
+    if type(payload["providerVersion"]) is not str:
         return False
 
     # destroyApproved
-    if not exact_type(payload["destroyApproved"], bool):
+    if type(payload["destroyApproved"]) is not bool:
         return False
 
     # resource
     resource = payload["resource"]
 
-    if not exact_type(resource, dict):
+    if type(resource) is not dict:
         return False
 
     required_resource = {
@@ -484,41 +486,38 @@ def valid_terraform_schema(payload):
         "forceDestroy",
     }
 
-    if set(resource.keys()) != required_resource:
+    if not required_resource.issubset(resource.keys()):
         return False
 
-    if not exact_type(resource["address"], str):
+    if type(resource["address"]) is not str:
         return False
 
-    if not exact_type(resource["type"], str):
+    if type(resource["type"]) is not str:
         return False
 
-    if not exact_type(resource["action"], str):
+    if type(resource["action"]) is not str:
         return False
 
-    # labels must be an object/dict
-    if not exact_type(resource["labels"], dict):
+    if type(resource["labels"]) is not dict:
         return False
 
-    # All label values should be strings
     for key, value in resource["labels"].items():
-        if not exact_type(key, str):
+        if type(key) is not str:
             return False
 
-        if not exact_type(value, str):
+        if type(value) is not str:
             return False
 
-    # secret can be null OR a string
+    # secret: null OR string
     if resource["secret"] is not None:
-        if not exact_type(resource["secret"], str):
+        if type(resource["secret"]) is not str:
             return False
 
     # forceDestroy must be boolean
-    if not exact_type(resource["forceDestroy"], bool):
+    if type(resource["forceDestroy"]) is not bool:
         return False
 
     return True
-
 
 def valid_secret_reference(secret):
     """
