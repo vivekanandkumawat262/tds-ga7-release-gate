@@ -791,22 +791,12 @@ def contains_dangerous_scheme(text: str) -> bool:
 def extract_urls(channel: str, output: str):
     """
     Extract URLs according to the question.
-
-    html:
-        quoted src= and href= values
-
-    markdown:
-        target inside ](...)
-
-    url:
-        whole trimmed output
     """
 
     urls = []
 
     if channel == "html":
 
-        # Quoted src/href only
         pattern = re.compile(
             r"""(?i)\b(?:src|href)\s*=\s*(["'])(.*?)\1"""
         )
@@ -816,13 +806,13 @@ def extract_urls(channel: str, output: str):
 
     elif channel == "markdown":
 
-        # Target inside ](...)
         pattern = re.compile(
             r"""\]\(\s*(?:<([^>]+)>|([^)]+))\)"""
         )
 
         for match in pattern.finditer(output):
             value = match.group(1)
+
             if value is None:
                 value = match.group(2)
 
@@ -835,23 +825,38 @@ def extract_urls(channel: str, output: str):
 
     return urls
 
-
-def url_has_dangerous_scheme(url: str) -> bool:
+def safe_urlparse(url: str):
     """
-    Any extracted URL with a scheme other than
-    http/https is dangerous.
-
-    Protocol-relative //host/path is treated as https.
+    Parse a URL without allowing malformed input to crash
+    the endpoint.
     """
-
     candidate = url.strip()
 
     if candidate.startswith("//"):
         candidate = "https:" + candidate
 
-    parsed = urlparse(candidate)
+    try:
+        return urlparse(candidate)
+    except (ValueError, TypeError):
+        return None
 
-    # No scheme means relative URL and is allowed.
+
+def url_has_dangerous_scheme(url: str) -> bool:
+    """
+    Any extracted URL with a scheme other than http/https
+    is dangerous.
+
+    Relative URLs have no scheme and are allowed.
+    Protocol-relative URLs are treated as https.
+    """
+
+    parsed = safe_urlparse(url)
+
+    # Malformed URL: treat it as dangerous rather than
+    # allowing the server to crash.
+    if parsed is None:
+        return True
+
     if not parsed.scheme:
         return False
 
@@ -859,42 +864,39 @@ def url_has_dangerous_scheme(url: str) -> bool:
         "http",
         "https",
     }
-
-
 def url_is_external_exfil(url: str) -> bool:
     """
-    Absolute URLs must have an exact hostname match.
+    Absolute HTTP/HTTPS URLs must have an exact hostname
+    match against the assigned allowlist.
 
-    Credentials and query strings are intentionally ignored
-    for allowlist comparison; only parsed hostname matters.
+    Relative references are allowed.
     """
 
-    candidate = url.strip()
+    parsed = safe_urlparse(url)
 
-    # Protocol-relative URL counts as absolute.
-    if candidate.startswith("//"):
-        candidate = "https:" + candidate
+    # Malformed URL
+    if parsed is None:
+        return True
 
-    parsed = urlparse(candidate)
-
-    # Relative references are allowed.
+    # Relative reference such as /local/page
     if not parsed.scheme and not parsed.netloc:
         return False
 
-    # If it has a scheme but isn't http/https,
-    # dangerous scheme is handled separately.
+    # Non-http/https schemes are handled by
+    # url_has_dangerous_scheme().
     if parsed.scheme.lower() not in {"http", "https"}:
         return False
 
-    hostname = parsed.hostname
+    try:
+        hostname = parsed.hostname
+    except (ValueError, TypeError):
+        return True
 
     if hostname is None:
         return True
 
-    # EXACT hostname matching.
+    # EXACT hostname comparison
     return hostname.lower() not in ALLOWED_EXTERNAL_HOSTS
-
-
 def html_has_script_tag(output: str) -> bool:
     """
     Opening script, iframe, object or embed tags.
