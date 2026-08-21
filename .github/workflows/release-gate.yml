@@ -1,0 +1,86 @@
+name: TDS GA7 Release Gate
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test-release-gate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: TDS identity: 23f2004577@ds.study.iitm.ac.in
+        run: echo "TDS identity: 23f2004577@ds.study.iitm.ac.in"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Start API
+        run: |
+          uvicorn main:app --host 0.0.0.0 --port 8000 &
+          sleep 3
+
+      - name: Test release gate
+        run: |
+          python - <<'PY'
+          import urllib.request
+          import json
+
+          payload = {
+              "target": "preview",
+              "event": "pull_request",
+              "ref": "refs/heads/test",
+              "workflow": {
+                  "trigger": "pull_request",
+                  "permissions": {
+                      "contents": "read",
+                      "packages": "write",
+                      "id-token": "none"
+                  },
+                  "testsPassed": True,
+                  "matrixComplete": True,
+                  "failFast": False,
+                  "actions": [
+                      {
+                          "owner": "actions",
+                          "name": "checkout",
+                          "ref": "v4"
+                      }
+                  ]
+              },
+              "image": {
+                  "multiStage": True,
+                  "runsAsRoot": False,
+                  "secretMode": "none",
+                  "criticalVulnerabilities": 0,
+                  "digestPinned": True
+              }
+          }
+
+          req = urllib.request.Request(
+              "http://127.0.0.1:8000/release-gate",
+              data=json.dumps(payload).encode(),
+              headers={"Content-Type": "application/json"},
+              method="POST"
+          )
+
+          response = urllib.request.urlopen(req)
+          result = json.loads(response.read())
+
+          print(result)
+
+          assert result["decision"] == "promote"
+          assert result["violations"] == []
+          PY
