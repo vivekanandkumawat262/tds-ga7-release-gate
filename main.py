@@ -677,9 +677,8 @@ def terraform_plan(payload: dict[str, Any]):
     }
 
 
-
 # ============================================================
-# Question 4: /sanitize-output
+# Question 4: LLM Output Handling Gate
 # ============================================================
 
 ALLOWED_EXTERNAL_HOSTS = {
@@ -687,7 +686,7 @@ ALLOWED_EXTERNAL_HOSTS = {
     "app-kfmsilv.example",
 }
 
-ALLOWED_CHANNELS = {
+VALID_CHANNELS = {
     "html",
     "markdown",
     "url",
@@ -699,24 +698,16 @@ ALLOWED_CHANNELS = {
 def decode_once(value: str) -> str:
     """
     Decode exactly once in this order:
-
-    1. Percent escapes
-    2. HTML entities
-    3. \\uXXXX escapes
+      1. percent escapes
+      2. selected HTML entities
+      3. \\uXXXX escapes
     """
 
-    # 1. Percent decoding
+    # 1. Percent escapes
     decoded = unquote(value)
 
-    # 2. Decode only the HTML entities specified by the question.
-    #
-    # Numeric:
-    #   &#NN;
-    #   &#xNN;
-    #
-    # Named:
-    #   &lt; &gt; &quot; &apos; &amp;
-
+    # 2. HTML entities
+    # Only the entities specified by the question.
     entity_map = {
         "&lt;": "<",
         "&gt;": ">",
@@ -725,31 +716,31 @@ def decode_once(value: str) -> str:
         "&amp;": "&",
     }
 
-    # Numeric HTML entities
+    decoded = re.sub(
+        r"&(?:lt|gt|quot|apos|amp);",
+        lambda m: entity_map[m.group(0)],
+        decoded,
+        flags=re.IGNORECASE,
+    )
+
+    # Numeric HTML entities: &#NN; and &#xNN;
     def decode_numeric_entity(match):
-        text = match.group(0)
+        token = match.group(0)
 
         try:
-            if text.lower().startswith("&#x"):
-                number = int(text[3:-1], 16)
-            else:
-                number = int(text[2:-1], 10)
-
-            return chr(number)
+            if token.lower().startswith("&#x"):
+                return chr(int(token[3:-1], 16))
+            return chr(int(token[2:-1], 10))
         except (ValueError, OverflowError):
-            return text
+            return token
 
     decoded = re.sub(
-        r"&#(?:[0-9]+|[xX][0-9a-fA-F]+);",
+        r"&#(?:[0-9]+|x[0-9a-fA-F]+);",
         decode_numeric_entity,
         decoded,
     )
 
-    # Named entities
-    for entity, replacement in entity_map.items():
-        decoded = decoded.replace(entity, replacement)
-
-    # 3. Decode literal \uXXXX escapes
+    # 3. Decode \uXXXX
     def decode_unicode_escape(match):
         try:
             return chr(int(match.group(1), 16))
@@ -765,20 +756,19 @@ def decode_once(value: str) -> str:
     return decoded
 
 
-def contains_dangerous_scheme(text: str) -> bool:
+def dangerous_scheme(text: str) -> bool:
     """
     Detect:
       javascript:
       data:
       vbscript:
 
-    with optional whitespace before the colon.
-
-    Also detect extracted URLs whose scheme is not
+    with optional whitespace before colon.
+    Also detect extracted URLs using schemes other than
     http/https.
     """
 
-    # Direct dangerous schemes
+    # Explicit dangerous schemes anywhere in text.
     if re.search(
         r"(?i)(?:javascript|data|vbscript)\s*:",
         text,
@@ -788,372 +778,427 @@ def contains_dangerous_scheme(text: str) -> bool:
     return False
 
 
-def extract_urls(channel: str, output: str):
+def extract_html_urls(text: str):
     """
-    Extract URLs according to the question.
+    Extract quoted src= and href= values.
     """
 
-    urls = []
+    pattern = re.compile(
+        r"""(?is)\b(?:src|href)\s*=\s*(['"])(.*?)\1"""
+    )
 
+    return [match.group(2) for match in pattern.finditer(text)]
+
+
+def extract_markdown_urls(text: str):
+    """
+    Extract the target inside ](...).
+    """
+
+    pattern = re.compile(
+        r"""\]\(\s*([^)]+?)\s*\)"""
+    )
+
+    results = []
+
+    for match in pattern.finditer(text):
+        target = match.group(1).strip()
+
+        # Markdown titles may follow the URL:
+        # ](https://example.com "title")
+        if target.startswith("<"):
+            end = target.find(">")
+            if end != -1:
+                target = target[1:end]
+        else:
+            # Take first whitespace-separated token.
+            target = target.split()[0]
+
+        results.append(target)
+
+    return results
+
+
+def extract_urls(channel: str, text: str):
     if channel == "html":
+        return extract_html_urls(text)
 
-        pattern = re.compile(
-            r"""(?i)\b(?:src|href)\s*=\s*(["'])(.*?)\1"""
-        )
+    if channel == "markdown":
+        return extract_markdown_urls(text)
 
-        for match in pattern.finditer(output):
-            urls.append(match.group(2))
+    if channel == "url":
+        return [text.strip()]
 
-    elif channel == "markdown":
-
-        pattern = re.compile(
-            r"""\]\(\s*(?:<([^>]+)>|([^)]+))\)"""
-        )
-
-        for match in pattern.finditer(output):
-            value = match.group(1)
-
-            if value is None:
-                value = match.group(2)
-
-            if value is not None:
-                urls.append(value.strip())
-
-    elif channel == "url":
-
-        urls.append(output.strip())
-
-    return urls
-
-def safe_urlparse(url: str):
-    """
-    Parse a URL without allowing malformed input to crash
-    the endpoint.
-    """
-    candidate = url.strip()
-
-    if candidate.startswith("//"):
-        candidate = "https:" + candidate
-
-    try:
-        return urlparse(candidate)
-    except (ValueError, TypeError):
-        return None
+    return []
 
 
 def url_has_dangerous_scheme(url: str) -> bool:
     """
-    Any extracted URL with a scheme other than http/https
-    is dangerous.
+    Determine whether an extracted URL has a scheme other
+    than http/https.
 
-    Relative URLs have no scheme and are allowed.
-    Protocol-relative URLs are treated as https.
-    """
-
-    parsed = safe_urlparse(url)
-
-    # Malformed URL: treat it as dangerous rather than
-    # allowing the server to crash.
-    if parsed is None:
-        return True
-
-    if not parsed.scheme:
-        return False
-
-    return parsed.scheme.lower() not in {
-        "http",
-        "https",
-    }
-def url_is_external_exfil(url: str) -> bool:
-    """
-    Absolute HTTP/HTTPS URLs must have an exact hostname
-    match against the assigned allowlist.
-
+    Protocol-relative URLs are resolved as https.
     Relative references are allowed.
     """
 
-    parsed = safe_urlparse(url)
+    candidate = url.strip()
 
-    # Malformed URL
-    if parsed is None:
-        return True
-
-    # Relative reference such as /local/page
-    if not parsed.scheme and not parsed.netloc:
+    if not candidate:
         return False
 
-    # Non-http/https schemes are handled by
-    # url_has_dangerous_scheme().
+    # Protocol-relative reference: //host/path
+    if candidate.startswith("//"):
+        parsed = urlparse("https:" + candidate)
+
+        # It has an effective https scheme.
+        return parsed.scheme.lower() not in {"http", "https"}
+
+    parsed = urlparse(candidate)
+
+    # Relative URL: /local/page, page, ./foo
+    if not parsed.scheme:
+        return False
+
+    return parsed.scheme.lower() not in {"http", "https"}
+
+
+def url_is_external_and_disallowed(url: str) -> bool:
+    """
+    Only absolute URLs are subject to the external-host allowlist.
+
+    Allowed:
+      relative URLs
+      exact allowed hostnames
+
+    Not allowed:
+      other absolute hosts
+      protocol-relative hosts not on allowlist
+    """
+
+    candidate = url.strip()
+
+    if not candidate:
+        return False
+
+    # Protocol-relative URL is absolute.
+    if candidate.startswith("//"):
+        parsed = urlparse("https:" + candidate)
+
+        hostname = parsed.hostname
+
+        return hostname not in ALLOWED_EXTERNAL_HOSTS
+
+    parsed = urlparse(candidate)
+
+    # Relative URL is fine.
+    if not parsed.scheme:
+        return False
+
+    # At this point http/https should be the only safe schemes.
     if parsed.scheme.lower() not in {"http", "https"}:
         return False
 
-    try:
-        hostname = parsed.hostname
-    except (ValueError, TypeError):
-        return True
+    # Absolute URL: compare parsed hostname ONLY.
+    hostname = parsed.hostname
 
-    if hostname is None:
-        return True
+    return hostname not in ALLOWED_EXTERNAL_HOSTS
 
-    # EXACT hostname comparison
-    return hostname.lower() not in ALLOWED_EXTERNAL_HOSTS
-def html_has_script_tag(output: str) -> bool:
+
+def contains_script_tag(text: str) -> bool:
     """
     Opening script, iframe, object or embed tags.
     """
 
     return bool(
         re.search(
-            r"(?i)<\s*(?:script|iframe|object|embed)\b",
-            output,
+            r"(?is)<\s*(?:script|iframe|object|embed)\b",
+            text,
         )
     )
 
 
-def html_has_event_handler(output: str) -> bool:
+def contains_event_handler(text: str) -> bool:
     """
-    Detect attributes such as:
+    Detect HTML attributes such as:
+      onclick=
+      onload=
+      onerror=
+      onmouseover=
 
-        onclick=
-        onload=
-        onerror=
-        onmouseover=
-
+    The rule is an on...= attribute.
     """
 
     return bool(
         re.search(
-            r"(?i)\bon[a-zA-Z0-9_-]*\s*=",
-            output,
+            r"""(?is)\bon[a-zA-Z][a-zA-Z0-9_-]*\s*=""",
+            text,
         )
     )
 
 
-def sql_has_metachar(output: str) -> bool:
-
-    if "'" in output:
+def contains_sql_metachar(text: str) -> bool:
+    if "'" in text:
         return True
 
-    if '"' in output:
+    if '"' in text:
         return True
 
-    if ";" in output:
+    if ";" in text:
         return True
 
-    if "--" in output:
+    if "--" in text:
         return True
 
-    if "/*" in output:
+    if "/*" in text:
         return True
 
-    if re.search(r"(?i)\bunion\b", output):
+    if re.search(r"(?i)\bunion\b", text):
         return True
 
-    if re.search(r"(?i)\bor\s+1\s*=\s*1\b", output):
-        return True
-
-    return False
-
-
-def shell_has_metachar(output: str) -> bool:
-
-    if re.search(r"[;&|`<>]", output):
-        return True
-
-    if "$(" in output:
-        return True
-
-    if "${" in output:
+    if re.search(r"(?i)\bor\s+1\s*=\s*1\b", text):
         return True
 
     return False
 
 
-def channel_rule_violation(channel: str, output: str):
-    """
-    Apply channel-specific rules in the exact order
-    specified by the question.
+def contains_shell_metachar(text: str) -> bool:
+    # ; & | ` < >
+    if re.search(r"[;&|`<>]", text):
+        return True
 
-    Returns the first reason or None.
+    # $(
+    if "$(" in text:
+        return True
+
+    # ${
+    if "${" in text:
+        return True
+
+    return False
+
+
+def trips_channel_rule(channel: str, text: str) -> bool:
+    """
+    Used for the encoded-payload test.
+
+    Returns whether the decoded value would violate any
+    applicable channel rule.
     """
 
-    # --------------------------------------------------------
-    # HTML
-    # --------------------------------------------------------
     if channel == "html":
+        if contains_script_tag(text):
+            return True
 
-        if html_has_script_tag(output):
-            return "SCRIPT_TAG"
+        if contains_event_handler(text):
+            return True
 
-        if html_has_event_handler(output):
-            return "EVENT_HANDLER"
+        if dangerous_scheme(text):
+            return True
 
-        if contains_dangerous_scheme(output):
-            return "DANGEROUS_SCHEME"
-
-        urls = extract_urls(channel, output)
-
-        for url in urls:
+        for url in extract_html_urls(text):
             if url_has_dangerous_scheme(url):
-                return "DANGEROUS_SCHEME"
+                return True
 
-        for url in urls:
-            if url_is_external_exfil(url):
-                return "EXTERNAL_EXFIL"
+            if url_is_external_and_disallowed(url):
+                return True
 
-        return None
+        return False
 
-    # --------------------------------------------------------
-    # MARKDOWN
-    # --------------------------------------------------------
     if channel == "markdown":
+        if dangerous_scheme(text):
+            return True
 
-        if contains_dangerous_scheme(output):
-            return "DANGEROUS_SCHEME"
-
-        urls = extract_urls(channel, output)
-
-        for url in urls:
+        for url in extract_markdown_urls(text):
             if url_has_dangerous_scheme(url):
-                return "DANGEROUS_SCHEME"
+                return True
 
-        for url in urls:
-            if url_is_external_exfil(url):
-                return "EXTERNAL_EXFIL"
+            if url_is_external_and_disallowed(url):
+                return True
 
-        return None
+        return False
 
-    # --------------------------------------------------------
-    # URL
-    # --------------------------------------------------------
     if channel == "url":
+        if dangerous_scheme(text):
+            return True
 
-        if contains_dangerous_scheme(output):
-            return "DANGEROUS_SCHEME"
+        url = text.strip()
 
-        urls = extract_urls(channel, output)
+        if url_has_dangerous_scheme(url):
+            return True
 
-        for url in urls:
-            if url_has_dangerous_scheme(url):
-                return "DANGEROUS_SCHEME"
+        if url_is_external_and_disallowed(url):
+            return True
 
-        for url in urls:
-            if url_is_external_exfil(url):
-                return "EXTERNAL_EXFIL"
+        return False
 
-        return None
-
-    # --------------------------------------------------------
-    # SQL
-    # --------------------------------------------------------
     if channel == "sql":
+        return contains_sql_metachar(text)
 
-        if sql_has_metachar(output):
-            return "SQL_METACHAR"
-
-        return None
-
-    # --------------------------------------------------------
-    # SHELL
-    # --------------------------------------------------------
     if channel == "shell":
+        return contains_shell_metachar(text)
 
-        if shell_has_metachar(output):
-            return "SHELL_METACHAR"
-
-        return None
-
-    return None
-
+    return False
 
 
 @app.post("/sanitize-output")
 def sanitize_output(payload: Any = Body(...)):
-    # ========================================================
+
+    # --------------------------------------------------------
     # 1. INVALID_SCHEMA
-    # ========================================================
+    # --------------------------------------------------------
 
     if not isinstance(payload, dict):
         return {
             "safe": False,
-            "reason": "INVALID_SCHEMA"
+            "reason": "INVALID_SCHEMA",
         }
 
-    if "channel" not in payload:
+    if payload.get("channel") not in VALID_CHANNELS:
         return {
             "safe": False,
-            "reason": "INVALID_SCHEMA"
+            "reason": "INVALID_SCHEMA",
         }
 
-    if "output" not in payload:
+    if not isinstance(payload.get("output"), str):
         return {
             "safe": False,
-            "reason": "INVALID_SCHEMA"
+            "reason": "INVALID_SCHEMA",
         }
 
-    channel = payload["channel"]
     output = payload["output"]
-
-    # IMPORTANT: type-check BEFORE set membership
-    if not isinstance(channel, str):
-        return {
-            "safe": False,
-            "reason": "INVALID_SCHEMA"
-        }
-
-    if channel not in ALLOWED_CHANNELS:
-        return {
-            "safe": False,
-            "reason": "INVALID_SCHEMA"
-        }
-
-    if not isinstance(output, str):
-        return {
-            "safe": False,
-            "reason": "INVALID_SCHEMA"
-        }
 
     if len(output) > 20000:
         return {
             "safe": False,
-            "reason": "INVALID_SCHEMA"
+            "reason": "INVALID_SCHEMA",
         }
 
-    # ========================================================
+    channel = payload["channel"]
+
+    # --------------------------------------------------------
     # 2. ENCODED_PAYLOAD
-    # ========================================================
+    # --------------------------------------------------------
 
     decoded = decode_once(output)
 
-    if decoded != output:
+    if decoded != output and trips_channel_rule(channel, decoded):
 
-        decoded_violation = channel_rule_violation(
-            channel,
-            decoded
-        )
-
-        if decoded_violation is not None:
-            return {
-                "safe": False,
-                "reason": "ENCODED_PAYLOAD"
-            }
-
-    # ========================================================
-    # 3. ORIGINAL OUTPUT
-    # ========================================================
-
-    violation = channel_rule_violation(
-        channel,
-        output
-    )
-
-    if violation is not None:
         return {
             "safe": False,
-            "reason": violation
+            "reason": "ENCODED_PAYLOAD",
         }
+
+    # --------------------------------------------------------
+    # 3. CHANNEL RULES
+    # --------------------------------------------------------
+
+    if channel == "html":
+
+        # SCRIPT_TAG
+        if contains_script_tag(output):
+            return {
+                "safe": False,
+                "reason": "SCRIPT_TAG",
+            }
+
+        # EVENT_HANDLER
+        if contains_event_handler(output):
+            return {
+                "safe": False,
+                "reason": "EVENT_HANDLER",
+            }
+
+        # DANGEROUS_SCHEME
+        if dangerous_scheme(output):
+            return {
+                "safe": False,
+                "reason": "DANGEROUS_SCHEME",
+            }
+
+        # EXTERNAL_EXFIL
+        for url in extract_html_urls(output):
+
+            if url_has_dangerous_scheme(url):
+                return {
+                    "safe": False,
+                    "reason": "DANGEROUS_SCHEME",
+                }
+
+            if url_is_external_and_disallowed(url):
+                return {
+                    "safe": False,
+                    "reason": "EXTERNAL_EXFIL",
+                }
+
+    elif channel == "markdown":
+
+        # DANGEROUS_SCHEME
+        if dangerous_scheme(output):
+            return {
+                "safe": False,
+                "reason": "DANGEROUS_SCHEME",
+            }
+
+        # EXTERNAL_EXFIL
+        for url in extract_markdown_urls(output):
+
+            if url_has_dangerous_scheme(url):
+                return {
+                    "safe": False,
+                    "reason": "DANGEROUS_SCHEME",
+                }
+
+            if url_is_external_and_disallowed(url):
+                return {
+                    "safe": False,
+                    "reason": "EXTERNAL_EXFIL",
+                }
+
+    elif channel == "url":
+
+        # DANGEROUS_SCHEME
+        if dangerous_scheme(output):
+            return {
+                "safe": False,
+                "reason": "DANGEROUS_SCHEME",
+            }
+
+        url = output.strip()
+
+        if url_has_dangerous_scheme(url):
+            return {
+                "safe": False,
+                "reason": "DANGEROUS_SCHEME",
+            }
+
+        # EXTERNAL_EXFIL
+        if url_is_external_and_disallowed(url):
+            return {
+                "safe": False,
+                "reason": "EXTERNAL_EXFIL",
+            }
+
+    elif channel == "sql":
+
+        if contains_sql_metachar(output):
+            return {
+                "safe": False,
+                "reason": "SQL_METACHAR",
+            }
+
+    elif channel == "shell":
+
+        if contains_shell_metachar(output):
+            return {
+                "safe": False,
+                "reason": "SHELL_METACHAR",
+            }
+
+    # --------------------------------------------------------
+    # SAFE
+    # --------------------------------------------------------
 
     return {
         "safe": True,
-        "reason": "SAFE"
+        "reason": "SAFE",
     }
