@@ -1066,6 +1066,7 @@ def channel_rule_violation(channel: str, output: str):
     return None
 
 
+
 @app.post("/sanitize-output")
 def sanitize_output(payload: Any):
 
@@ -1093,6 +1094,13 @@ def sanitize_output(payload: Any):
 
     channel = payload["channel"]
     output = payload["output"]
+
+    # IMPORTANT: type-check BEFORE set membership
+    if not isinstance(channel, str):
+        return {
+            "safe": False,
+            "reason": "INVALID_SCHEMA"
+        }
 
     if channel not in ALLOWED_CHANNELS:
         return {
@@ -1132,7 +1140,7 @@ def sanitize_output(payload: Any):
             }
 
     # ========================================================
-    # 3. ORIGINAL OUTPUT RULES
+    # 3. ORIGINAL OUTPUT
     # ========================================================
 
     violation = channel_rule_violation(
@@ -1145,10 +1153,6 @@ def sanitize_output(payload: Any):
             "safe": False,
             "reason": violation
         }
-
-    # ========================================================
-    # SAFE
-    # ========================================================
 
     return {
         "safe": True,
