@@ -489,15 +489,18 @@ def valid_terraform_schema(payload):
     if not required_resource.issubset(resource.keys()):
         return False
 
-    if type(resource["address"]) is not str:
-        return False
+    if type(resource["address"]) is not str or resource["address"] == "":
+         return False
 
-    if type(resource["type"]) is not str:
+    if type(resource["type"]) is not str or resource["type"] == "":
         return False
 
     if type(resource["action"]) is not str:
         return False
 
+    if resource["action"] not in {"create", "update", "delete"}:
+       return False
+    
     if type(resource["labels"]) is not dict:
         return False
 
