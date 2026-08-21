@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Body
 from typing import Any
 import re
 import html
@@ -12,8 +12,8 @@ ASSIGNED_TENANT = "tenant-mkc2fyf"
 ALLOWED_EMAIL_DOMAIN = "notify-v6i11cb.example"
 
 
-@app.post("/release-gate")
-def release_gate(payload: dict[str, Any]):
+@app.post("/sanitize-output")
+def sanitize_output(payload: Any = Body(...)):
     violations = []
 
     workflow = payload.get("workflow", {})
