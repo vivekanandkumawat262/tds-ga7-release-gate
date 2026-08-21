@@ -398,3 +398,276 @@ def action_firewall(payload: dict[str, Any]):
         "decision": "allow",
         "reason": "ALLOW"
     }
+
+
+
+# ============================================================
+# Question 3: /terraform/plan
+# ============================================================
+
+TERRAFORM_WORKSPACE = "prod-qpc0oo"
+
+REQUIRED_LABELS = {
+    "owner": "student-oszqt",
+    "environment": "production",
+    "cost_center": "cc-7jnf",
+}
+
+
+def exact_type(value, expected_type):
+    """
+    Strict type check.
+    This prevents True from being accepted as an integer, etc.
+    """
+    return type(value) is expected_type
+
+
+def valid_terraform_schema(payload):
+    """
+    Validate the complete normalized request schema first.
+    If this fails, the answer must be INVALID_PLAN.
+    """
+
+    if not exact_type(payload, dict):
+        return False
+
+    required_top = {
+        "environment",
+        "state",
+        "providerVersion",
+        "destroyApproved",
+        "resource",
+    }
+
+    if set(payload.keys()) != required_top:
+        return False
+
+    # environment
+    if not exact_type(payload["environment"], str):
+        return False
+
+    # state
+    state = payload["state"]
+
+    if not exact_type(state, dict):
+        return False
+
+    if set(state.keys()) != {"backend", "locked"}:
+        return False
+
+    if not exact_type(state["backend"], str):
+        return False
+
+    if not exact_type(state["locked"], bool):
+        return False
+
+    # providerVersion
+    if not exact_type(payload["providerVersion"], str):
+        return False
+
+    # destroyApproved
+    if not exact_type(payload["destroyApproved"], bool):
+        return False
+
+    # resource
+    resource = payload["resource"]
+
+    if not exact_type(resource, dict):
+        return False
+
+    required_resource = {
+        "address",
+        "type",
+        "action",
+        "labels",
+        "secret",
+        "forceDestroy",
+    }
+
+    if set(resource.keys()) != required_resource:
+        return False
+
+    if not exact_type(resource["address"], str):
+        return False
+
+    if not exact_type(resource["type"], str):
+        return False
+
+    if not exact_type(resource["action"], str):
+        return False
+
+    # labels must be an object/dict
+    if not exact_type(resource["labels"], dict):
+        return False
+
+    # All label values should be strings
+    for key, value in resource["labels"].items():
+        if not exact_type(key, str):
+            return False
+
+        if not exact_type(value, str):
+            return False
+
+    # secret can be null OR a string
+    if resource["secret"] is not None:
+        if not exact_type(resource["secret"], str):
+            return False
+
+    # forceDestroy must be boolean
+    if not exact_type(resource["forceDestroy"], bool):
+        return False
+
+    return True
+
+
+def valid_secret_reference(secret):
+    """
+    secret must be:
+      null
+      OR
+      non-empty secret://... reference
+    """
+
+    if secret is None:
+        return True
+
+    if not isinstance(secret, str):
+        return False
+
+    if not secret.startswith("secret://"):
+        return False
+
+    # Must contain something after secret://
+    if len(secret) <= len("secret://"):
+        return False
+
+    return True
+
+
+@app.post("/terraform/plan")
+def terraform_plan(payload: dict[str, Any]):
+
+    # --------------------------------------------------------
+    # 1. INVALID PLAN
+    # --------------------------------------------------------
+    if not valid_terraform_schema(payload):
+        return {
+            "decision": "reject",
+            "reason": "INVALID_PLAN"
+        }
+
+    resource = payload["resource"]
+    state = payload["state"]
+
+    # --------------------------------------------------------
+    # 2. ENVIRONMENT
+    # --------------------------------------------------------
+    if payload["environment"] != TERRAFORM_WORKSPACE:
+        return {
+            "decision": "reject",
+            "reason": "ENVIRONMENT_MISMATCH"
+        }
+
+    # --------------------------------------------------------
+    # 3. STATE SAFETY
+    # --------------------------------------------------------
+    allowed_backends = {
+        "gcs",
+        "s3",
+        "azurerm",
+        "remote",
+    }
+
+    if (
+        state["backend"] not in allowed_backends
+        or state["locked"] is not True
+    ):
+        return {
+            "decision": "reject",
+            "reason": "STATE_UNSAFE"
+        }
+
+    # --------------------------------------------------------
+    # 4. PROVIDER PINNING
+    # --------------------------------------------------------
+    provider = payload["providerVersion"]
+
+    allowed_provider_versions = {
+        "6.2.1",
+        "= 6.2.1",
+        "~> 6.0",
+    }
+
+    if provider not in allowed_provider_versions:
+        return {
+            "decision": "reject",
+            "reason": "UNPINNED_PROVIDER"
+        }
+
+    # --------------------------------------------------------
+    # 5. REQUIRED LABELS
+    # --------------------------------------------------------
+    labels = resource["labels"]
+
+    for key, expected_value in REQUIRED_LABELS.items():
+
+        if key not in labels:
+            return {
+                "decision": "reject",
+                "reason": "MISSING_LABELS"
+            }
+
+        if labels[key] != expected_value:
+            return {
+                "decision": "reject",
+                "reason": "MISSING_LABELS"
+            }
+
+    # --------------------------------------------------------
+    # 6. SECRET
+    # --------------------------------------------------------
+    if not valid_secret_reference(resource["secret"]):
+        return {
+            "decision": "reject",
+            "reason": "PLAINTEXT_SECRET"
+        }
+
+    # --------------------------------------------------------
+    # 7. DESTRUCTIVE DELETE
+    # --------------------------------------------------------
+    stateful_resources = {
+        "storage_bucket",
+        "sql_database",
+        "persistent_disk",
+    }
+
+    if (
+        resource["action"] == "delete"
+        and resource["type"] in stateful_resources
+        and payload["destroyApproved"] is not True
+    ):
+        return {
+            "decision": "reject",
+            "reason": "DELETE_NOT_APPROVED"
+        }
+
+    # --------------------------------------------------------
+    # 8. FORCE DESTROY
+    # --------------------------------------------------------
+    if (
+        resource["type"] == "storage_bucket"
+        and payload["environment"] == TERRAFORM_WORKSPACE
+        and resource["forceDestroy"] is True
+    ):
+        return {
+            "decision": "reject",
+            "reason": "FORCE_DESTROY"
+        }
+
+    # --------------------------------------------------------
+    # EVERYTHING PASSED
+    # --------------------------------------------------------
+    return {
+        "decision": "approve",
+        "reason": "APPROVE"
+    }
